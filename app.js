@@ -10,6 +10,9 @@ const MON_SHORT = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','
 const TYPES = ['Libro','Manga','Cómic','Artículo','Otro'];
 const SPINES = ['#2E4A5A','#7B3F4A','#3F6248','#8A5A1F','#55467A','#2F6B6B','#4D5B2B','#1F3F8A','#6B3A6B','#5A3E2B'];
 const STATUSES = ['reading','read','want'];
+const CFG = window.MP_CONFIG || {};
+const SYNC_ON = !!(CFG.supabaseUrl && CFG.supabaseKey);
+const AUTH_KEY = 'marcapaginas:auth';
 const I = {
   plus:'<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" fill="none"/></svg>',
   back:'<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
@@ -29,6 +32,10 @@ const S = {
   statsYear: null,       // número o 'all'
   items: [],
   goals: {},             // { "2026": 24 }
+  goalsT: {},            // cuándo se cambió cada meta (para sincronizar)
+  deleted: {},           // { idLibro: cuándo se borró } (para sincronizar borrados)
+  meta: { since: 0, lastSync: 0, lastBackup: 0 },
+  sync: { state: 'idle', msg: '' },
   draft: { kind: 'quote', page: '', text: '', pg: null }
 };
 let D = null;            // estado del diálogo abierto
@@ -112,26 +119,243 @@ function load() {
     if (!raw) return;
     const d = JSON.parse(raw);
     S.items = Array.isArray(d.items) ? d.items : [];
-    S.goals = d.goals && typeof d.goals === 'object' ? d.goals : {};
+    S.goals = isObj(d.goals) ? d.goals : {};
+    S.goalsT = isObj(d.goalsT) ? d.goalsT : {};
+    S.deleted = isObj(d.deleted) ? d.deleted : {};
+    S.meta = Object.assign(S.meta, isObj(d.meta) ? d.meta : {});
+    Object.keys(S.goals).forEach((y) => { if (!S.goalsT[y]) S.goalsT[y] = 1; });
   } catch (e) { S.items = []; S.goals = {}; }
 }
 let askedPersist = false;
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify({ version: 2, items: S.items, goals: S.goals })); }
+function save(opts) {
+  if (!S.meta.since) S.meta.since = Date.now();
+  try { localStorage.setItem(KEY, JSON.stringify({ version: 3, items: S.items, goals: S.goals, goalsT: S.goalsT, deleted: S.deleted, meta: S.meta })); }
   catch (e) { toast('No se pudo guardar en este dispositivo. Exporta una copia desde Resumen.'); }
   if (!askedPersist && navigator.storage && navigator.storage.persist) {
     askedPersist = true; navigator.storage.persist().catch(() => {});
   }
+  if (!(opts && opts.noSync)) scheduleSync();
 }
 function putItem(it) {
+  it.updatedAt = Date.now();
   const i = S.items.findIndex((x) => x.id === it.id);
   if (i < 0) S.items.push(it); else S.items[i] = it;
   save(); render();
 }
 function removeItem(id) {
   S.items = S.items.filter((x) => x.id !== id);
+  S.deleted[id] = Date.now();
   if (S.detail === id) S.detail = null;
   save(); render();
+}
+
+
+/* ================= Sincronización con Supabase =================
+   Estrategia: la app trabaja siempre con los datos locales. Si hay sesión,
+   descarga la copia de la nube, la combina (gana lo más reciente de cada libro)
+   y sube el resultado. Solo usa fetch: no hay librerías externas. */
+const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+let auth = null;
+let syncing = false, syncAgain = false, syncTimer = null, lastSyncTry = 0;
+
+function loadAuth() {
+  try { const a = JSON.parse(localStorage.getItem(AUTH_KEY) || 'null'); return a && a.access_token && a.refresh_token && a.user_id ? a : null; }
+  catch (e) { return null; }
+}
+function storeAuth(a) {
+  auth = a;
+  try { if (a) localStorage.setItem(AUTH_KEY, JSON.stringify(a)); else localStorage.removeItem(AUTH_KEY); } catch (e) { /* sin almacenamiento */ }
+}
+const baseUrl = () => String(CFG.supabaseUrl).replace(/\/+$/, '');
+async function api(path, o = {}) {
+  const headers = Object.assign({ apikey: CFG.supabaseKey, 'Content-Type': 'application/json' }, o.headers || {});
+  if (o.token) headers.Authorization = 'Bearer ' + o.token;
+  const res = await fetch(baseUrl() + path, { method: o.method || 'GET', headers, body: o.body ? JSON.stringify(o.body) : undefined });
+  let data = null;
+  const txt = await res.text();
+  if (txt) { try { data = JSON.parse(txt); } catch (e) { data = txt; } }
+  return { ok: res.ok, status: res.status, data };
+}
+function sessionFrom(d) {
+  return {
+    access_token: d.access_token, refresh_token: d.refresh_token,
+    expires_at: d.expires_at ? d.expires_at * 1000 : Date.now() + (d.expires_in || 3600) * 1000,
+    email: (d.user && d.user.email) || (auth && auth.email) || '',
+    user_id: (d.user && d.user.id) || (auth && auth.user_id)
+  };
+}
+async function signIn(email, password) {
+  const r = await api('/auth/v1/token?grant_type=password', { method: 'POST', body: { email, password } });
+  if (!r.ok) {
+    const m = (r.data && (r.data.error_description || r.data.msg || r.data.message)) || '';
+    const c = (r.data && (r.data.error_code || r.data.error)) || '';
+    throw new Error(/invalid[ _]login|invalid_credentials/i.test(m + ' ' + c) ? 'Correo o contraseña incorrectos.' : (m || 'No se pudo iniciar sesión (' + r.status + ').'));
+  }
+  storeAuth(sessionFrom(r.data));
+}
+const sessionError = () => Object.assign(new Error('session'), { code: 'session' });
+async function refreshSession() {
+  if (!auth) throw sessionError();
+  const r = await api('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: auth.refresh_token } });
+  if (r.ok) { storeAuth(sessionFrom(r.data)); return; }
+  if (r.status === 400 || r.status === 401 || r.status === 403) { storeAuth(null); throw sessionError(); }
+  throw new Error('refresh ' + r.status);
+}
+async function rest(method, path, body, prefer, retried) {
+  if (!auth) throw sessionError();
+  if (auth.expires_at - 60000 < Date.now()) await refreshSession();
+  const r = await api('/rest/v1/' + path, { method, body, token: auth.access_token, headers: prefer ? { Prefer: prefer } : {} });
+  if (r.status === 401 && !retried) { await refreshSession(); return rest(method, path, body, prefer, true); }
+  return r;
+}
+const snapshot = () => ({ v: 3, items: S.items, goals: S.goals, goalsT: S.goalsT, deleted: S.deleted });
+function cleanGoals(g) {
+  const o = {};
+  if (isObj(g)) Object.keys(g).forEach((y) => { if (/^\d{4}$/.test(y) && num1(g[y])) o[y] = num1(g[y]); });
+  return o;
+}
+/* Forma canónica para comparar dos copias sin que importe el orden */
+function canon(d) {
+  const items = (Array.isArray(d.items) ? d.items : []).map(sanitize).filter(Boolean).sort((a, b) => (a.id < b.id ? -1 : 1));
+  return stable({ items, goals: cleanGoals(d.goals), goalsT: isObj(d.goalsT) ? d.goalsT : {}, deleted: isObj(d.deleted) ? d.deleted : {} });
+}
+function stable(v) {
+  if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
+  if (isObj(v)) return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stable(v[k])).join(',') + '}';
+  return JSON.stringify(v);
+}
+/* Combina la copia de la nube con la local. Gana lo más reciente de cada libro; los borrados se respetan. */
+function mergeData(remote) {
+  const map = new Map();
+  S.items.forEach((i) => map.set(i.id, i));
+  (Array.isArray(remote.items) ? remote.items : []).map(sanitize).filter(Boolean).forEach((r) => {
+    const l = map.get(r.id);
+    if (!l || (r.updatedAt || 0) > (l.updatedAt || 0)) map.set(r.id, r);
+  });
+  const del = Object.assign({}, S.deleted);
+  const rdel = isObj(remote.deleted) ? remote.deleted : {};
+  Object.keys(rdel).forEach((id) => { const t = +rdel[id] || 0; if (!(del[id] >= t)) del[id] = t; });
+  Object.keys(del).forEach((id) => {
+    const it = map.get(id);
+    if (it && del[id] >= (it.updatedAt || 0)) map.delete(id);
+  });
+  Object.keys(del).forEach((id) => { if (map.has(id) || Date.now() - del[id] > 1.55e10) delete del[id]; });
+  const goals = Object.assign({}, S.goals), goalsT = Object.assign({}, S.goalsT);
+  const rg = isObj(remote.goals) ? remote.goals : {}, rgt = isObj(remote.goalsT) ? remote.goalsT : {};
+  new Set([...Object.keys(goalsT), ...Object.keys(rgt), ...Object.keys(rg)]).forEach((y) => {
+    if (!/^\d{4}$/.test(y)) return;
+    const lt = +goalsT[y] || 0, rt = +rgt[y] || (rg[y] ? 1 : 0);
+    if (rt > lt) { goalsT[y] = rt; if (num1(rg[y])) goals[y] = num1(rg[y]); else delete goals[y]; }
+  });
+  S.items = [...map.values()]; S.deleted = del; S.goals = goals; S.goalsT = goalsT;
+}
+async function remoteGet() {
+  const r = await rest('GET', 'library?select=data,rev&user_id=eq.' + auth.user_id);
+  if (!r.ok) throw new Error('get ' + r.status);
+  return Array.isArray(r.data) && r.data[0] ? r.data[0] : null;
+}
+async function remotePut(row) {
+  const payload = snapshot();
+  const r = row
+    ? await rest('PATCH', 'library?user_id=eq.' + auth.user_id + '&rev=eq.' + row.rev, { data: payload, rev: row.rev + 1, updated_at: new Date().toISOString() }, 'return=representation')
+    : await rest('POST', 'library', { user_id: auth.user_id, data: payload, rev: 1 }, 'return=representation');
+  if (r.status === 409) return false;                                   // alguien más guardó primero
+  if (!r.ok) throw new Error('put ' + r.status);
+  if (row && Array.isArray(r.data) && !r.data.length) return false;      // la revisión cambió
+  return true;
+}
+function scheduleSync(ms) {
+  if (!SYNC_ON || !auth) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncNow(false), ms || 1500);
+}
+function setSync(state, msg) {
+  S.sync = { state, msg: msg || '' };
+  if (S.tab === 'stats' && !S.detail && S.search === null) render();
+}
+function ago(ts) {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1) return 'hace un momento';
+  if (m < 60) return 'hace ' + plural(m, 'minuto', 'minutos');
+  const h = Math.floor(m / 60);
+  if (h < 24) return 'hace ' + plural(h, 'hora', 'horas');
+  const d = Math.floor(h / 24);
+  return 'hace ' + plural(d, 'día', 'días');
+}
+function syncText() {
+  const st = S.sync.state;
+  if (st === 'syncing') return 'Sincronizando…';
+  if (st === 'offline') return 'Sin conexión. Se sincronizará cuando vuelvas a tener internet.';
+  if (st === 'error') return 'No se pudo sincronizar. ' + (S.sync.msg || 'Inténtalo de nuevo en un momento.');
+  return S.meta.lastSync ? 'Todo sincronizado. Última vez ' + ago(S.meta.lastSync) + '.' : 'Aún no se ha sincronizado.';
+}
+function friendlyError(e) {
+  const m = String(e && e.message || '');
+  if (/^get 404|^put 404/.test(m)) return 'No encuentro la tabla «library» en Supabase. Ejecuta el SQL de configuración.';
+  if (/^(get|put) (401|403)/.test(m)) return 'Supabase rechazó el permiso. Revisa las políticas del SQL de configuración.';
+  if (m === 'conflict') return 'Hubo cambios al mismo tiempo desde otro lugar. Vuelve a intentarlo.';
+  return 'Inténtalo de nuevo en un momento (' + m + ').';
+}
+async function syncNow(manual) {
+  if (!SYNC_ON) return;
+  if (!auth) { if (manual) toast('Inicia sesión para sincronizar.'); return; }
+  if (syncing) { syncAgain = true; return; }
+  syncing = true; lastSyncTry = Date.now();
+  setSync('syncing');
+  let state = 'ok', msg = '';
+  try {
+    for (let i = 0; i < 4; i++) {
+      const row = await remoteGet();
+      const rdata = row && isObj(row.data) ? row.data : {};
+      if (row) {
+        const before = canon(snapshot());
+        mergeData(rdata);
+        if (canon(snapshot()) !== before) { save({ noSync: true }); render(); }
+        if (canon(rdata) === canon(snapshot())) break;                   // la nube ya está al día
+      }
+      if (await remotePut(row)) break;
+      if (i === 3) throw new Error('conflict');
+    }
+    S.meta.lastSync = Date.now(); save({ noSync: true });
+  } catch (e) {
+    console.error(e);
+    if (e && e.code === 'session') { state = 'idle'; toast('Tu sesión venció. Inicia sesión otra vez para seguir sincronizando.'); }
+    else if (e instanceof TypeError) state = 'offline';
+    else { state = 'error'; msg = friendlyError(e); }
+  }
+  syncing = false;
+  setSync(state, msg);
+  if (manual && state === 'ok') toast('Todo sincronizado.');
+  else if (manual && state === 'offline') toast('Sin conexión.');
+  if (syncAgain) { syncAgain = false; scheduleSync(300); }
+}
+function syncBlock() {
+  if (!SYNC_ON) return '<section class="block"><h2>Sincronización</h2><p class="note" style="margin:0">La sincronización en la nube no está configurada. Falta llenar el archivo config.js.</p></section>';
+  if (!auth) return '<section class="block"><h2>Sincronización</h2><p class="note" style="margin:0 0 14px">Inicia sesión para guardar tu biblioteca en la nube. Si el navegador borra los datos, la recuperas al volver a entrar.</p><button class="btn" data-action="login">Iniciar sesión</button></section>';
+  return '<section class="block"><h2>Sincronización</h2><p style="margin:0 0 4px">Sesión de <b>' + esc(auth.email) + '</b></p><p class="note" style="margin:0 0 14px">' + esc(syncText()) + '</p><div class="data-actions"><button class="btn ghost small" data-action="sync-now"' + (S.sync.state === 'syncing' ? ' disabled' : '') + '>Sincronizar ahora</button><button class="btn ghost small" data-action="logout">Cerrar sesión</button></div></section>';
+}
+function openLoginDialog() {
+  D = { kind: 'login' };
+  dlgShell('Iniciar sesión',
+    '<p>Usa el correo y la contraseña de la cuenta que creaste en Supabase para tu biblioteca.</p>' +
+    '<label class="f">Correo<input id="f-email" type="email" inputmode="email" autocomplete="username" autocapitalize="none"></label>' +
+    '<label class="f">Contraseña<input id="f-pass" type="password" autocomplete="current-password"></label>',
+    '<button class="btn ghost" data-action="close-dlg">Cancelar</button><button class="btn" id="login-btn" data-action="do-login">Entrar</button>');
+  openDlg();
+}
+async function doLogin() {
+  const email = $('f-email').value.trim(), pass = $('f-pass').value;
+  if (!/^\S+@\S+\.\S+$/.test(email)) return setErr('f-err', 'Escribe un correo válido.');
+  if (!pass) return setErr('f-err', 'Escribe tu contraseña.');
+  const btn = $('login-btn');
+  btn.disabled = true; btn.textContent = 'Entrando…'; setErr('f-err', '');
+  try {
+    await signIn(email, pass);
+    closeDlg(); toast('Sesión iniciada.'); render(); syncNow(true);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Entrar';
+    setErr('f-err', e instanceof TypeError ? 'No hay conexión con el servidor. Revisa tu internet.' : e.message);
+  }
 }
 
 /* ================= Piezas de interfaz ================= */
@@ -149,7 +373,11 @@ function emptyBlock(text, btnLabel, action) {
 function viewReading() {
   const list = byStatus('reading').sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   let h = head('Leyendo', list.length ? list.length + ' en curso' : '', 'Agregar lectura', 'add');
-  if (!list.length) return h + emptyBlock('No tienes ninguna lectura en curso. Registra lo que estás leyendo y guarda tu avance página por página.', 'Agregar lectura', 'add');
+  if (!list.length) {
+    h += emptyBlock('No tienes ninguna lectura en curso. Registra lo que estás leyendo y guarda tu avance página por página.', 'Agregar lectura', 'add');
+    if (SYNC_ON && !auth) h += '<div class="empty" style="margin-top:0;border-top:0;padding-top:0"><p style="font-size:16px">¿Ya usabas Marcapáginas? Inicia sesión para recuperar tu biblioteca.</p><button class="btn ghost" data-action="login">Iniciar sesión</button></div>';
+    return h;
+  }
   return h + '<ul class="list">' + list.map((it) => {
     const p = pct(it);
     return '<li><button class="row" data-action="open" data-id="' + it.id + '">' +
@@ -336,6 +564,7 @@ function viewStats() {
   const opts = years.map((yy) => '<option value="' + yy + '"' + (y === yy ? ' selected' : '') + '>' + yy + '</option>').join('') + '<option value="all"' + (y === 'all' ? ' selected' : '') + '>Todos los años</option>';
   let h = '<div class="stats-head"><h1>Resumen</h1><div><label class="sr-only" for="stats-year">Año</label><select id="stats-year">' + opts + '</select></div></div>';
 
+  if (SYNC_ON && !auth) h += syncBlock();
   if (y !== 'all') h += goalBlock(y, n);
 
   if (!n) {
@@ -382,7 +611,11 @@ function viewStats() {
     }
   }
 
+  if (!SYNC_ON || auth) h += syncBlock();
+  const ref = S.meta.lastBackup || S.meta.since;
+  const stale = !auth && S.items.length && ref && Date.now() - ref > 30 * 864e5;
   h += '<section class="block"><h2>Tus datos</h2><p class="note" style="margin:0 0 14px">Tu biblioteca se guarda en este dispositivo. Exporta una copia de vez en cuando para no perderla si cambias de teléfono o borras los datos del navegador.</p>' +
+    (stale ? '<p class="note" style="margin:-6px 0 14px;color:var(--accent)">Hace ' + plural(Math.floor((Date.now() - ref) / 864e5), 'día', 'días') + ' que no exportas una copia.</p>' : '') +
     '<div class="data-actions"><button class="btn ghost small" data-action="export-json">Exportar copia</button><button class="btn ghost small" data-action="import">Importar copia</button><button class="btn ghost small" data-action="export-csv">Exportar leídos (CSV)</button></div>' +
     '<div style="margin-top:16px">' + installBlock() + '</div></section>';
   return h;
@@ -671,6 +904,7 @@ function download(name, data, type) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 function exportJSON() {
+  S.meta.lastBackup = Date.now(); save({ noSync: true });
   download('marcapaginas-copia-' + todayStr() + '.json', JSON.stringify({ app: 'marcapaginas', version: 2, exportedAt: new Date().toISOString(), items: S.items, goals: S.goals }, null, 2), 'application/json');
   toast('Copia lista. Guarda el archivo en un lugar seguro.');
 }
@@ -716,8 +950,8 @@ function pickFile() {
       if (!items.length) { toast('No encontré libros en ese archivo.'); return; }
       const goals = data && data.goals && typeof data.goals === 'object' ? data.goals : {};
       confirmBox('¿Importar ' + plural(items.length, 'libro', 'libros') + '?', 'Se combinarán con tu biblioteca actual. Si un libro ya existe, se reemplaza por el del archivo.', 'Importar', () => {
-        items.forEach((it) => { const i = S.items.findIndex((x) => x.id === it.id); if (i < 0) S.items.push(it); else S.items[i] = it; });
-        Object.keys(goals).forEach((k) => { if (/^\d{4}$/.test(k) && num1(goals[k])) S.goals[k] = num1(goals[k]); });
+        items.forEach((it) => { it.updatedAt = Date.now(); delete S.deleted[it.id]; const i = S.items.findIndex((x) => x.id === it.id); if (i < 0) S.items.push(it); else S.items[i] = it; });
+        Object.keys(goals).forEach((k) => { if (/^\d{4}$/.test(k) && num1(goals[k])) { S.goals[k] = num1(goals[k]); S.goalsT[k] = Date.now(); } });
         save(); render(); toast('Importación lista.');
       });
     } catch (e) { toast('No pude leer ese archivo. Usa una copia exportada desde Marcapáginas.'); }
@@ -814,9 +1048,13 @@ const actions = {
     syncDialog();
     const v = String(D.goal).trim();
     if (!/^\d+$/.test(v) || !num1(v)) return setErr('f-err', 'Escribe un número de libros entre 1 y 1000.');
-    S.goals[D.year] = num1(v); save(); closeDlg(); render(); toast('Meta guardada.');
+    S.goals[D.year] = num1(v); S.goalsT[D.year] = Date.now(); save(); closeDlg(); render(); toast('Meta guardada.');
   },
-  'goal-clear': () => { delete S.goals[D.year]; save(); closeDlg(); render(); toast('Meta eliminada.'); },
+  'goal-clear': () => { delete S.goals[D.year]; S.goalsT[D.year] = Date.now(); save(); closeDlg(); render(); toast('Meta eliminada.'); },
+  'login': openLoginDialog,
+  'do-login': doLogin,
+  'sync-now': () => syncNow(true),
+  'logout': () => confirmBox('¿Cerrar sesión?', 'Tus libros seguirán en este dispositivo, pero dejarán de sincronizarse hasta que vuelvas a iniciar sesión.', 'Cerrar sesión', () => { storeAuth(null); S.sync = { state: 'idle', msg: '' }; render(); toast('Sesión cerrada.'); }),
   'export-json': exportJSON,
   'export-csv': exportCSV,
   'import': pickFile,
@@ -844,7 +1082,7 @@ document.addEventListener('keydown', (e) => {
   if (e.target.id === 'pg') { e.preventDefault(); savePage(S.detail); }
   else if (D && dlg.contains(e.target)) {
     e.preventDefault();
-    if (D.kind === 'item') saveItem(); else if (D.kind === 'finish') saveFinish(); else if (D.kind === 'goal') actions['goal-save']();
+    if (D.kind === 'item') saveItem(); else if (D.kind === 'finish') saveFinish(); else if (D.kind === 'goal') actions['goal-save'](); else if (D.kind === 'login') doLogin();
   }
 });
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; if (S.tab === 'stats' && !S.detail && S.search === null) render(); });
@@ -852,7 +1090,11 @@ window.addEventListener('appinstalled', () => { deferredInstall = null; toast('M
 
 /* ================= Arranque ================= */
 load();
+auth = SYNC_ON ? loadAuth() : null;
 render();
+if (auth) syncNow(false);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && auth && Date.now() - lastSyncTry > 20000) syncNow(false); });
+window.addEventListener('online', () => { if (auth) syncNow(false); });
 if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
 }

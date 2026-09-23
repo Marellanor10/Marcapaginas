@@ -2,13 +2,14 @@
    Guarda la app en el dispositivo para que abra sin internet.
    Estrategia: primero lo guardado, y se actualiza en segundo plano
    (los cambios se ven en la siguiente apertura). */
-const CACHE = 'marcapaginas-v1';   // súbele el número al publicar cambios grandes
+const CACHE = 'marcapaginas-v2';   // súbele el número al publicar cambios grandes
 const FONTS = 'marcapaginas-fuentes';
 const SHELL = [
   './',
   './index.html',
   './styles.css',
   './app.js',
+  './config.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -49,6 +50,17 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(req.url);
   const isFont = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
   if (url.origin !== self.location.origin && !isFont) return;
+
+  // config.js: primero la red, para que un cambio de configuración se vea de inmediato
+  if (url.origin === self.location.origin && url.pathname.endsWith('/config.js')) {
+    e.respondWith(
+      fetch(req).then((res) => {
+        if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
+        return res;
+      }).catch(() => caches.match(req, { ignoreSearch: true }))
+    );
+    return;
+  }
 
   e.respondWith(
     staleWhileRevalidate(req, isFont ? FONTS : CACHE, req.mode === 'navigate' ? './index.html' : null)
