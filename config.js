@@ -3,6 +3,6 @@
    Son datos públicos por diseño: la seguridad la dan las políticas del archivo supabase-setup.sql.
    NUNCA pegues aquí la clave "secret" ni la "service_role". */
 window.MP_CONFIG = {
-  supabaseUrl: '',   // ejemplo: 'https://abcdefghijk.supabase.co'
-  supabaseKey: ''    // ejemplo: 'sb_publishable_xxxxxxxxxxxxxxxx'
+  supabaseUrl: 'https://cdixnywblvzysqcsbiyb.supabase.co/rest/v1/',   // ejemplo: 'https://abcdefghijk.supabase.co'
+  supabaseKey: 'sb_publishable_mcMfIhsMF8In_6FS_fbITg_AFU-UfNu'    // ejemplo: 'sb_publishable_xxxxxxxxxxxxxxxx'
 };
